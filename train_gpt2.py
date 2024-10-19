@@ -232,11 +232,16 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(16, 1024)
+
+torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained('gpt2')
 model = GPT(GPTConfig())
 model.to(device)
+
+# we need to uncomment the next line to run on the super computer, I do not have enough memory to run this on my computer
+#model = torch.compile(model)
 #logits, loss = model(x, y)
 
 # optimizer
@@ -245,9 +250,12 @@ for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     opimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+
     loss.backward()
     opimizer.step()
+    torch.cuda.synchronize()
     print(f"step {i}, loss: {loss.item()}")
 
 

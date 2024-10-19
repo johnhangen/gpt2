@@ -1,0 +1,31 @@
+---------------------------------------
+Begin Slurm Prolog: Oct-19-2024 18:54:11
+Job ID:    860721
+User ID:   jhangen3
+Account:   coc
+Job name:  job_script.slurm
+Partition: coc-cpu
+---------------------------------------
+salloc: Pending job allocation 860722
+salloc: job 860722 queued and waiting for resources
+salloc: job 860722 has been allocated resources
+salloc: Granted job allocation 860722
+salloc: Waiting for resource configuration
+salloc: Nodes atl1-1-01-002-1-0 are ready for job
+srun: fatal: SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU, and SLURM_MEM_PER_NODE are mutually exclusive.
+salloc: Relinquishing job allocation 860722
+salloc: Job allocation 860722 has been revoked.
+/var/lib/slurm/slurmd/job860721/slurm_script: line 4: 2212782 Killed                  python3 train_gpt2.py
+slurmstepd: error: Detected 1 oom_kill event in StepId=860721.batch. Some of the step tasks have been OOM Killed.
+---------------------------------------
+Begin Slurm Epilog: Oct-19-2024 18:56:13
+Job ID:        860721
+Array Job ID:  _4294967294
+User ID:       jhangen3
+Account:       coc
+Job name:      job_script.slurm
+Resources:     cpu=1,mem=4G,node=1
+Rsrc Used:     cput=00:02:03,vmem=0,walltime=00:02:03,mem=4177456K,energy_used=0
+Partition:     coc-cpu
+Nodes:         atl1-1-02-003-19-1
+---------------------------------------

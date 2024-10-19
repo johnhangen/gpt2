@@ -1,0 +1,73 @@
+---------------------------------------
+Begin Slurm Prolog: Oct-19-2024 19:07:09
+Job ID:    860739
+User ID:   jhangen3
+Account:   coc
+Job name:  gpt2_training
+Partition: coc-gpu
+---------------------------------------
+using device: cuda
+total tokens: 338025
+1 epoch = 20 batches
+step 0, loss: 10.877635955810547
+step 1, loss: 10.027299880981445
+step 2, loss: 9.746614456176758
+step 3, loss: 9.630130767822266
+step 4, loss: 9.435331344604492
+step 5, loss: 9.409368515014648
+step 6, loss: 9.31941032409668
+step 7, loss: 9.17654800415039
+step 8, loss: 8.980712890625
+step 9, loss: 8.821494102478027
+step 10, loss: 8.674899101257324
+step 11, loss: 8.574459075927734
+step 12, loss: 8.401954650878906
+step 13, loss: 8.304441452026367
+step 14, loss: 8.221658706665039
+step 15, loss: 8.051984786987305
+step 16, loss: 7.95542049407959
+step 17, loss: 7.848458290100098
+step 18, loss: 7.756230354309082
+step 19, loss: 7.532071113586426
+step 20, loss: 7.452499866485596
+step 21, loss: 7.189844608306885
+step 22, loss: 7.214460372924805
+step 23, loss: 7.0997748374938965
+step 24, loss: 6.951914310455322
+step 25, loss: 7.05422306060791
+step 26, loss: 7.060801029205322
+step 27, loss: 6.940197467803955
+step 28, loss: 6.795046806335449
+step 29, loss: 6.671717643737793
+step 30, loss: 6.63253116607666
+step 31, loss: 6.615124225616455
+step 32, loss: 6.531811237335205
+step 33, loss: 6.56490421295166
+step 34, loss: 6.6075263023376465
+step 35, loss: 6.472515106201172
+step 36, loss: 6.456090927124023
+step 37, loss: 6.452050685882568
+step 38, loss: 6.419401168823242
+step 39, loss: 6.277973175048828
+step 40, loss: 6.4056901931762695
+step 41, loss: 6.196424961090088
+step 42, loss: 6.297572612762451
+step 43, loss: 6.192926406860352
+step 44, loss: 6.129428863525391
+step 45, loss: 6.3416748046875
+step 46, loss: 6.448891639709473
+step 47, loss: 6.345533847808838
+step 48, loss: 6.243166923522949
+step 49, loss: 6.144863128662109
+---------------------------------------
+Begin Slurm Epilog: Oct-19-2024 19:09:13
+Job ID:        860739
+Array Job ID:  _4294967294
+User ID:       jhangen3
+Account:       coc
+Job name:      gpt2_training
+Resources:     cpu=4,gres/gpu:v100=1,mem=16G,node=1
+Rsrc Used:     cput=00:08:12,vmem=0,walltime=00:02:03,mem=1054400K,energy_used=0
+Partition:     coc-gpu
+Nodes:         atl1-1-01-002-1-0
+---------------------------------------

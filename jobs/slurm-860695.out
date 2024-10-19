@@ -1,0 +1,24 @@
+---------------------------------------
+Begin Slurm Prolog: Oct-19-2024 18:40:51
+Job ID:    860695
+User ID:   jhangen3
+Account:   coc
+Job name:  job_script.slurm
+Partition: coc-cpu
+---------------------------------------
+Traceback (most recent call last):
+  File "/home/hice1/jhangen3/gpt2/train_gpt2.py", line 188, in <module>
+    import tiktoken
+ModuleNotFoundError: No module named 'tiktoken'
+---------------------------------------
+Begin Slurm Epilog: Oct-19-2024 18:41:42
+Job ID:        860695
+Array Job ID:  _4294967294
+User ID:       jhangen3
+Account:       coc
+Job name:      job_script.slurm
+Resources:     cpu=1,mem=4G,node=1
+Rsrc Used:     cput=00:00:51,vmem=0,walltime=00:00:51,mem=383228K,energy_used=0
+Partition:     coc-cpu
+Nodes:         atl1-1-01-005-1-2
+---------------------------------------

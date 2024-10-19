@@ -1,0 +1,31 @@
+---------------------------------------
+Begin Slurm Prolog: Oct-19-2024 19:02:34
+Job ID:    860732
+User ID:   jhangen3
+Account:   coc
+Job name:  job_script.slurm
+Partition: coc-cpu
+---------------------------------------
+salloc: Pending job allocation 860733
+salloc: job 860733 queued and waiting for resources
+salloc: job 860733 has been allocated resources
+salloc: Granted job allocation 860733
+salloc: Waiting for resource configuration
+salloc: Nodes atl1-1-01-002-1-0 are ready for job
+srun: fatal: SLURM_MEM_PER_CPU, SLURM_MEM_PER_GPU, and SLURM_MEM_PER_NODE are mutually exclusive.
+salloc: Relinquishing job allocation 860733
+salloc: Job allocation 860733 has been revoked.
+srun: error: atl1-1-02-003-19-1: task 0: Out Of Memory
+slurmstepd: error: Detected 1 oom_kill event in StepId=860732.0. Some of the step tasks have been OOM Killed.
+---------------------------------------
+Begin Slurm Epilog: Oct-19-2024 19:04:15
+Job ID:        860732
+Array Job ID:  _4294967294
+User ID:       jhangen3
+Account:       coc
+Job name:      job_script.slurm
+Resources:     cpu=1,mem=4G,node=1
+Rsrc Used:     cput=00:01:42,vmem=0,walltime=00:01:42,mem=6500K,energy_used=0
+Partition:     coc-cpu
+Nodes:         atl1-1-02-003-19-1
+---------------------------------------

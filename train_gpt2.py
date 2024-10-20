@@ -6,6 +6,7 @@ import math
 
 # -------------------------------
 class CausalSelfAttention(nn.Module):
+    # look for powers of 2
 
     def __init__(self, config):
         super().__init__()
@@ -26,10 +27,13 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # flash attention -> we never write att (online)
+        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        #att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1)
+        #y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.c_proj(y)
         return y
@@ -232,12 +236,13 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-train_loader = DataLoaderLite(16, 1024)
+train_loader = DataLoaderLite(4, 1024)
 
 torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+# we want our vocab size to be a power of 2
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 
 # we need to uncomment the next line to run on the super computer, I do not have enough memory to run this on my computer
@@ -245,7 +250,7 @@ model.to(device)
 #logits, loss = model(x, y)
 
 # optimizer
-opimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+opimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -254,9 +259,10 @@ for i in range(50):
         logits, loss = model(x, y)
 
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     opimizer.step()
-    torch.cuda.synchronize()
-    print(f"step {i}, loss: {loss.item()}")
+    #torch.cuda.synchronize()
+    print(f"step {i}, loss: {loss.item():.6f}, norm: {norm:.4f}")
 
 
 import sys; sys.exit(0)

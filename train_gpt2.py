@@ -386,13 +386,15 @@ for i in range(max_steps):
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
 
-    if i > 0 and i % 1000 == 0:
+    if i > 0 and i % 1000 == 0 and False:
         model.eval()
         tokens = enc.encode("Hello, I'm a language model,")
         tokens = torch.tensor(tokens, dtype=torch.long)
         # batch
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        x = tokens.to('cuda')
+        x = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(i)
         while x.size(1) < max_length:
             with torch.no_grad():
                 logits = model(x)
@@ -402,7 +404,7 @@ for i in range(max_steps):
                 probs = F.softmax(logits, dim=-1)
                 topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
 
-                ix = torch.multinomial(topk_probs, 1)
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
 
                 xcol = torch.gather(topk_indices, -1, ix)
 

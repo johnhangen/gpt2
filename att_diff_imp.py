@@ -41,129 +41,80 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 def lambda_init_fn(depth):
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
 
+@dataclass
+class GPTConfig:
+    block_size: int = 1024 # max sequence length
+    vocab_size: int = 50257 # number of tokens
+    n_layer: int = 12 # number of layers
+    n_head: int = 6 # number of heads
+    n_embd: int = 384 # embedding dimension
+    model_parallel_size: int = 1
+    decoder_kv_attention_heads: int = None
+
 # -------------------------------
 # Diff Transformer
 # -------------------------------
-class MultiheadDiffAttn(nn.Module):
+class DiffAttn(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        self.dk = config.n_embd // config.n_head
+        self.dv = config.n_embd // config.n_head
+        self.d = config.block_size
+        self.d_model = config.n_embd
+        self.w_q = nn.Linear(config.n_embd, self.dk)
+        self.w_k = nn.Linear(config.n_embd, self.dk)
+        self.w_v = nn.Linear(config.n_embd, self.dv)
+        self.softmax = nn.Softmax(dim=-1)
+    
+    def forward(self, x, λ):
+        # batch size, sequence length, embedding dimension
+        B, N, D = x.size() # 4, 1024, 384
+
+        assert self.w_q.weight.shape == (self.dk, self.d_model,), f"Q weight shape is {self.w_q.weight.shape}"
+        assert self.w_k.weight.shape == (self.dk, self.d_model,), f"K weight shape is {self.w_k.weight.shape}"
+        assert self.w_v.weight.shape == (self.dv, self.d_model,), f"V weight shape is {self.w_v.weight.shape}"
+
+        # [Q1, Q2] = XW^Q - I want (1024, 2028)
+        Q1, Q2 = torch.split(self.w_q(x), split_size_or_sections=32, dim=2)
+        # [K1, K2] = XW^K
+        K1, K2 = torch.split(self.w_k(x), split_size_or_sections=32, dim=2)
+        # [V1, V2] = XW^V
+        V = self.w_v(x)
+
+        # assert Q, K, V
+        assert Q1.shape == (B, N, self.dk/2), f"Q1 shape is {Q1.shape}"
+        assert Q2.shape == (B, N, self.dk/2), f"Q2 shape is {Q2.shape}"
+        assert K1.shape == (B, N, self.dk/2), f"K1 shape is {K1.shape}"
+        assert K2.shape == (B, N, self.dk/2), f"K2 shape is {K2.shape}"
+        assert V.shape == (B, N, self.dv), f"V shape is {V.shape}"
+
+        # Qi, Ki: [b, n, d]; V; [b, n, 2d]
+        s = 1 / math.sqrt(self.d)
+
+        A1 = (Q1 @ K1.transpose(-1, -2)) * s
+        A2 = (Q2 @ K2.transpose(-1, -2)) * s
+
+        return (self.softmax(A1) - (λ*self.softmax(A2))) @ V
+    
+class MultiHead(nn.Module):
     def __init__(
         self,
         config,
     ):
         super().__init__()
-        # take the configs file and turn it into the vars diff trans needs
-        embed_dim = config.n_embd
-        depth = config.n_layer
-        num_heads = config.n_head
-
-        self.embed_dim = embed_dim
-        # num_heads set to half of Transformer's #heads
-        # this seems like it helps with preforence 
-        self.num_heads = num_heads // config.model_parallel_size
-        self.num_kv_heads = config.decoder_kv_attention_heads // config.model_parallel_size if config.decoder_kv_attention_heads is not None else num_heads // config.model_parallel_size
-        self.n_rep = self.num_heads // self.num_kv_heads
-        
-        self.head_dim = embed_dim // num_heads // 2
-        self.scaling = self.head_dim ** -0.5
-        
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.k_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
-        self.v_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
-
-        # this is our lambda init, whcih acts as a weighting facotr for controling stregth
-        self.lambda_init = lambda_init_fn(depth)
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
-
-        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+        self.d = config.block_size
+        self.d_model = config.n_embd
+        self.dv = config.n_embd // config.n_head
+        self.w_o = nn.Linear(config.n_head*self.dv, self.d_model)
+        self.λ = 0.8 - 0.6 * math.exp(-0.3 * config.n_layer)
+        self.LN = RMSNorm(self.dv, eps=1e-5, elementwise_affine=True)
+        self.GroupNorm = nn.GroupNorm(1, self.d*2, eps=1e-5)
+        self.heads = nn.ModuleList([DiffAttn(config) for _ in range(config.n_head)])        
     
-    def forward(self, x, rel_pos=None, attn_mask=None,):
-        bsz, tgt_len, embed_dim = x.size()
-        src_len = tgt_len
-
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-
-        q = q.view(bsz, tgt_len, 2 * self.num_heads, self.head_dim)
-        k = k.view(bsz, src_len, 2 * self.num_kv_heads, self.head_dim)
-        v = v.view(bsz, src_len, self.num_kv_heads, 2 * self.head_dim)
-
-        # this is ROPE - https://arxiv.org/abs/2104.09864 - is rel_pos just pos_emb???
-        #q = apply_rotary_emb(q, *rel_pos, interleaved=True)
-        #k = apply_rotary_emb(k, *rel_pos, interleaved=True)
-
-        offset = src_len - tgt_len
-        q = q.transpose(1, 2)
-        k = repeat_kv(k.transpose(1, 2), self.n_rep)
-        v = repeat_kv(v.transpose(1, 2), self.n_rep)
-        q *= self.scaling
-        attn_weights = torch.matmul(q, k.transpose(-1, -2))
-        if attn_mask is None:
-            attn_mask = torch.triu(
-                torch.zeros([tgt_len, src_len])
-                .float()
-                .fill_(float("-inf"))
-                .type_as(attn_weights),
-                1 + offset,
-            )
-        attn_weights = torch.nan_to_num(attn_weights)
-        attn_weights += attn_mask   
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
-            attn_weights
-        )
-
-        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
-        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
-        lambda_full = lambda_1 - lambda_2 + self.lambda_init
-        attn_weights = attn_weights.view(bsz, self.num_heads, 2, tgt_len, src_len)
-        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
-        
-        attn = torch.matmul(attn_weights, v)
-        attn = self.subln(attn)
-        attn = attn * (1 - self.lambda_init)
-        attn = attn.transpose(1, 2).reshape(bsz, tgt_len, self.num_heads * 2 * self.head_dim)
-
-        attn = self.out_proj(attn)
-        return attn
-
-# -------------------------------
-# Mutli Head Attention
-# -------------------------------
-class CausalSelfAttention(nn.Module):
-    # look for powers of 2
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        self.c_attn = nn.Linear(config.n_embd, config.n_embd * 3)
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
-        self.c_proj.NANOGPT_SCALE_INIT = 1
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                             .view(1, 1, config.block_size, config.block_size))
-        
     def forward(self, x):
-        B, T, C = x.size()
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-
-        # flash attention -> we never write att (online)
-        #att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        #att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        #att = F.softmax(att, dim=-1)
-        #y = att @ v
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        y = self.c_proj(y)
-        return y
+        O = [self.LN(head(x, self.λ))*(1-self.λ) for head in self.heads]
+        return self.w_o(torch.concat(O, dim=2) )
 
 # -------------------------------
 # FC Layer
@@ -192,7 +143,7 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = MultiheadDiffAttn(config)
+        self.attn = MultiHead(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -202,16 +153,6 @@ class Block(nn.Module):
         # no info being exchanged here, think individual about what they communicated about
         x = x + self.mlp(self.ln_2(x))
         return x
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024 # max sequence length
-    vocab_size: int = 50257 # number of tokens
-    n_layer: int = 12 # number of layers
-    n_head: int = 6 # number of heads
-    n_embd: int = 384 # embedding dimension
-    model_parallel_size: int = 1
-    decoder_kv_attention_heads: int = None
 
 # -------------------------------
 # GPT Model
@@ -422,7 +363,7 @@ enc = tiktoken.get_encoding('gpt2')
 
 
 total_batch_size = 524288
-B = 4 # micro batch size
+B = 2 # micro batch size
 T = 1024 # sequence length
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -546,9 +487,7 @@ for i in range(max_steps):
         param_group['lr'] = lr
 
     optimizer.step()
-    torch.cuda.synchronize()
-    if master_process:
-        print(f"step {i}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}, lr: {lr:.4e}")
+    print(f"step {i}, loss: {loss_accum.item():.6f}, norm: {norm:.4f}, lr: {lr:.4e}")
 
 if ddp:
     destroy_process_group()

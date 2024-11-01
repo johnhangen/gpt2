@@ -15,8 +15,9 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from .kernel.rotary import apply_rotary_emb
-from .rms_norm import RMSNorm
+# ROPE is only aviailable in linux
+#from .kernel.rotary import apply_rotary_emb
+from rms_norm import RMSNorm
 
 
 # -------------------------------
@@ -78,7 +79,7 @@ class MultiheadDiffAttn(nn.Module):
 
         self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
     
-    def forward(self, x, rel_pos, attn_mask=None,):
+    def forward(self, x, rel_pos=None, attn_mask=None,):
         bsz, tgt_len, embed_dim = x.size()
         src_len = tgt_len
 
@@ -344,19 +345,47 @@ class DataLoaderLite:
             self.current_position = B * T * self.process_rank
         return x, y
     
+class DataLoaderSMALL:
+    def __init__(self, B, T, process_rank, num_processes):
+        self.B = B
+        self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
+
+        # at init load tokens from disk and store them in memory
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        if master_process:
+            print(f"loaded {len(self.tokens)} tokens")
+
+        # state
+        self.current_position = self.B * self.T * self.process_rank
+
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position+B*T+1]
+        x = (buf[:-1]).view(B, T) # inputs
+        y = (buf[1:]).view(B, T) # targets
+        # advance the position in the tensor
+        self.current_position += B * T * self.num_processes
+        # if loading the next batch would be out of bounds, reset
+        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+            self.current_position = self.B * self.T * self.process_rank
+        return x, y
 # -------------------------------
 # Trainning loop
+# python train_gpt2.py or torchrun --standalone --nproc_per_node=8 train_gpt2.py
 # -------------------------------
-
-# simple launch:
-# python train_gpt2.py
-# DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
 
 num_return_sequences = 5
 max_length = 30
 
-# set up DDP (distributed data parallel).
+# -------------------------------
+# DDP (Distributed Data Parallel)
+# -------------------------------
 # torchrun command sets the env variables RANK, LOCAL_RANK, and WORLD_SIZE
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -385,7 +414,6 @@ else:
     
 device_type = "cuda" if device.startswith("cuda") else "cpu"
 
-
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
@@ -402,19 +430,36 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
+# -------------------------------
+# Options
+# -------------------------------
+dataset = 'small' # small runs the input.txt, if u want fineweb change
+transfer_learning = False # if true loads weights from hugging weights (func not imp)
+compile_model = False 
+
+# -------------------------------
+# data loader set up
+# -------------------------------
+if dataset == 'small':
+    train_loader = DataLoaderSMALL(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size)
+else:
+    train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
+    val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
 
 
 torch.set_float32_matmul_precision('high')
 
-# model = GPT.from_pretrained('gpt2')
-# we want our vocab size to be a power of 2
-model = GPT(GPTConfig(vocab_size=50304))
+# -------------------------------
+# init model
+# -------------------------------
+if transfer_learning:
+    model = GPT.from_pretrained('gpt2')
+else:
+    model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
-# we need to uncomment the next line to run on the super computer, I do not have enough memory to run this on my computer
 
-if False:
+
+if compile_model:
     model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -452,25 +497,27 @@ optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4,
 for i in range(max_steps):
     t0 = time.time()
 
-    if i % 100 == 0:
-        model.eval()
-        val_loader.reset()
-        with torch.no_grad():
-            val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
-                x, y = val_loader.next_batch()
-                x, y = x.to(device), y.to(device)
-                with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    logits, loss = model(x, y)
+    if dataset != 'small':
+        # for the input.txt we dont have a validation set
+        if i % 100 == 0:
+            model.eval()
+            val_loader.reset()
+            with torch.no_grad():
+                val_loss_accum = 0.0
+                val_loss_steps = 20
+                for _ in range(val_loss_steps):
+                    x, y = val_loader.next_batch()
+                    x, y = x.to(device), y.to(device)
+                    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+                        logits, loss = model(x, y)
 
-                loss = loss / val_loss_steps
-                val_loss_accum += loss.detach()
-        
-        if ddp:
-            dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
-        if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
+                    loss = loss / val_loss_steps
+                    val_loss_accum += loss.detach()
+            
+            if ddp:
+                dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            if master_process:
+                print(f"validation loss: {val_loss_accum.item():.4f}")
 
     # train
     model.train()

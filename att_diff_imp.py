@@ -1,12 +1,135 @@
+# gen imports
 from dataclasses import dataclass
+import math
+import inspect
+import tiktoken
+import numpy as np
+import os
+import time 
+
+# torch imports
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-import math
-import inspect
-import time
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
+
+from .kernel.rotary import apply_rotary_emb
+from .rms_norm import RMSNorm
 
 
+# -------------------------------
+# Funcs for Diff Transformer
+# -------------------------------
+
+def init_method(tensor, **kwargs):
+    nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """torch.repeat_interleave(x, dim=1, repeats=n_rep)"""
+    bs, n_kv_heads, slen, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, None, :, :]
+        .expand(bs, n_kv_heads, n_rep, slen, head_dim)
+        .reshape(bs, n_kv_heads * n_rep, slen, head_dim)
+    )
+
+def lambda_init_fn(depth):
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+# -------------------------------
+# Diff Transformer
+# -------------------------------
+class MultiheadDiffAttn(nn.Module):
+    def __init__(
+        self,
+        config,
+    ):
+        super().__init__()
+        # take the configs file and turn it into the vars diff trans needs
+        embed_dim = config.n_embd
+        depth = config.n_layer
+        num_heads = config.n_head
+
+        self.embed_dim = embed_dim
+        # num_heads set to half of Transformer's #heads
+        # this seems like it helps with preforence 
+        self.num_heads = num_heads // config.model_parallel_size
+        self.num_kv_heads = config.decoder_kv_attention_heads // config.model_parallel_size if config.decoder_kv_attention_heads is not None else num_heads // config.model_parallel_size
+        self.n_rep = self.num_heads // self.num_kv_heads
+        
+        self.head_dim = embed_dim // num_heads // 2
+        self.scaling = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.k_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
+        self.v_proj = nn.Linear(embed_dim, embed_dim // self.n_rep, bias=False)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=False)
+
+        # this is our lambda init, whcih acts as a weighting facotr for controling stregth
+        self.lambda_init = lambda_init_fn(depth)
+        self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+        self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim, dtype=torch.float32).normal_(mean=0,std=0.1))
+
+        self.subln = RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=True)
+    
+    def forward(self, x, rel_pos, attn_mask=None,):
+        bsz, tgt_len, embed_dim = x.size()
+        src_len = tgt_len
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        q = q.view(bsz, tgt_len, 2 * self.num_heads, self.head_dim)
+        k = k.view(bsz, src_len, 2 * self.num_kv_heads, self.head_dim)
+        v = v.view(bsz, src_len, self.num_kv_heads, 2 * self.head_dim)
+
+        # this is ROPE - https://arxiv.org/abs/2104.09864 - is rel_pos just pos_emb???
+        #q = apply_rotary_emb(q, *rel_pos, interleaved=True)
+        #k = apply_rotary_emb(k, *rel_pos, interleaved=True)
+
+        offset = src_len - tgt_len
+        q = q.transpose(1, 2)
+        k = repeat_kv(k.transpose(1, 2), self.n_rep)
+        v = repeat_kv(v.transpose(1, 2), self.n_rep)
+        q *= self.scaling
+        attn_weights = torch.matmul(q, k.transpose(-1, -2))
+        if attn_mask is None:
+            attn_mask = torch.triu(
+                torch.zeros([tgt_len, src_len])
+                .float()
+                .fill_(float("-inf"))
+                .type_as(attn_weights),
+                1 + offset,
+            )
+        attn_weights = torch.nan_to_num(attn_weights)
+        attn_weights += attn_mask   
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(
+            attn_weights
+        )
+
+        lambda_1 = torch.exp(torch.sum(self.lambda_q1 * self.lambda_k1, dim=-1).float()).type_as(q)
+        lambda_2 = torch.exp(torch.sum(self.lambda_q2 * self.lambda_k2, dim=-1).float()).type_as(q)
+        lambda_full = lambda_1 - lambda_2 + self.lambda_init
+        attn_weights = attn_weights.view(bsz, self.num_heads, 2, tgt_len, src_len)
+        attn_weights = attn_weights[:, :, 0] - lambda_full * attn_weights[:, :, 1]
+        
+        attn = torch.matmul(attn_weights, v)
+        attn = self.subln(attn)
+        attn = attn * (1 - self.lambda_init)
+        attn = attn.transpose(1, 2).reshape(bsz, tgt_len, self.num_heads * 2 * self.head_dim)
+
+        attn = self.out_proj(attn)
+        return attn
+
+# -------------------------------
+# Mutli Head Attention
 # -------------------------------
 class CausalSelfAttention(nn.Module):
     # look for powers of 2
@@ -41,8 +164,9 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-
-
+# -------------------------------
+# FC Layer
+# -------------------------------
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -59,12 +183,15 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
+# -------------------------------
+# Transformer Block
+# -------------------------------
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = CausalSelfAttention(config)
+        self.attn = MultiheadDiffAttn(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -82,7 +209,12 @@ class GPTConfig:
     n_layer: int = 12 # number of layers
     n_head: int = 6 # number of heads
     n_embd: int = 384 # embedding dimension
+    model_parallel_size: int = 1
+    decoder_kv_attention_heads: int = None
 
+# -------------------------------
+# GPT Model
+# -------------------------------
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -138,7 +270,6 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
-
 # -------------------------------
 
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
@@ -164,10 +295,9 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 
-# ------------------------------- 
-import tiktoken
-import numpy as np
-
+# -------------------------------
+# Data Loader
+# -------------------------------
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32) # added after video
@@ -214,44 +344,9 @@ class DataLoaderLite:
             self.current_position = B * T * self.process_rank
         return x, y
     
-
-class DataLoaderSMALL:
-    def __init__(self, B, T, process_rank, num_processes):
-        self.B = B
-        self.T = T
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-
-        # at init load tokens from disk and store them in memory
-        with open('input.txt', 'r') as f:
-            text = f.read()
-        enc = tiktoken.get_encoding('gpt2')
-        tokens = enc.encode(text)
-        self.tokens = torch.tensor(tokens)
-        if master_process:
-            print(f"loaded {len(self.tokens)} tokens")
-
-        # state
-        self.current_position = self.B * self.T * self.process_rank
-
-    def next_batch(self):
-        B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the position in the tensor
-        self.current_position += B * T * self.num_processes
-        # if loading the next batch would be out of bounds, reset
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_position = self.B * self.T * self.process_rank
-        return x, y
-    
 # -------------------------------
-# run the training loop
-import os
-from torch.distributed import init_process_group, destroy_process_group
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.distributed as dist
+# Trainning loop
+# -------------------------------
 
 # simple launch:
 # python train_gpt2.py
@@ -287,10 +382,15 @@ else:
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = "mps"
     print(f"using device: {device}")
+    
+device_type = "cuda" if device.startswith("cuda") else "cpu"
+
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
+
+enc = tiktoken.get_encoding('gpt2')
 
 
 total_batch_size = 524288
@@ -302,7 +402,9 @@ if master_process:
     print(f"total desired batch size: {total_batch_size}")
     print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
-train_loader = DataLoaderSMALL(B, T, ddp_local_rank, ddp_world_size)
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
+
 
 torch.set_float32_matmul_precision('high')
 
@@ -311,15 +413,17 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
 # we need to uncomment the next line to run on the super computer, I do not have enough memory to run this on my computer
-#model = torch.compile(model)
+
+if False:
+    model = torch.compile(model)
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
-
 raw_model = model.module if ddp else model
 
-import tiktoken
-enc = tiktoken.get_encoding('gpt2')
 
+# -------------------------------
+# Set up for learning rate 
+# -------------------------------
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
@@ -339,48 +443,12 @@ def get_lr(it):
 
 
 # optimizer
-# opimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device)
-for step in range(max_steps):
-    t0 = time.time()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch()
-        x, y = x.to(device), y.to(device)
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            logits, loss = model(x, y)
-        # we have to scale the loss to account for gradient accumulation,
-        # because the gradients just add on each successive backward().
-        # addition of gradients corresponds to a SUM in the objective, but
-        # instead of a SUM we want MEAN. Scale the loss here so it comes out right
-        loss = loss / grad_accum_steps
-        loss_accum += loss.detach()
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
-        loss.backward()
-    if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    # determine and set the learning rate for this iteration
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    torch.cuda.synchronize() # wait for the GPU to finish work
-    t1 = time.time()
-    dt = t1 - t0 # time difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = tokens_processed / dt
-    if master_process:
-        print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
-if ddp:
-    destroy_process_group()
 
-import sys; sys.exit(0)
-
-"""
+# -------------------------------
+# Training Loop
+# -------------------------------
 for i in range(max_steps):
     t0 = time.time()
 
@@ -403,35 +471,6 @@ for i in range(max_steps):
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f"validation loss: {val_loss_accum.item():.4f}")
-
-    if i > 0 and i % 1000 == 0 and False:
-        model.eval()
-        tokens = enc.encode("Hello, I'm a language model,")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        # batch
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        x = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(i)
-        while x.size(1) < max_length:
-            with torch.no_grad():
-                logits = model(x)
-
-                # only last column logits
-                logits = logits[:, -1, :] 
-                probs = F.softmax(logits, dim=-1)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng)
-
-                xcol = torch.gather(topk_indices, -1, ix)
-
-                x = torch.cat((x, xcol), dim=1)
-
-        for i in range(num_return_sequences):
-            tokens = x[i, :max_length].tolist()
-            decoded = enc.decode(tokens)
-            print(">", decoded)
 
     # train
     model.train()
@@ -466,4 +505,3 @@ for i in range(max_steps):
 
 if ddp:
     destroy_process_group()
-"""
